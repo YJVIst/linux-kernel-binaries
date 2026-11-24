@@ -3,3 +3,4 @@ b661086cebe2684682e5ed917cbe4be1e51c56e72246cfd7d4b8c5a23d1caabd  linux-headers-
 f4e779cd57518b08cbe225869d33c6d6bbc2e495bd84ee7e69ccadef3ae294bf  linux-image-7.3.6_7.3.6-2_amd64.deb
 d9a52a10358c6bc65c8830c79ff0efe478998cbf67d0b292295a52cd60d13552  tcp-collapse-7.3.6.patch
 952acbaef3a9e8aa0a07c57afe4687007b5c6de033ab328417fe7d3457ee20a2  vmlinuz-7.3.6
+5d02c4ae27bf96b2dd37f628a4a7f179e26270ae3570b2ddc3bd9573be669a9f  install-kernel.sh
