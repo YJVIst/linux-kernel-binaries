@@ -1,0 +1,128 @@
+From: Mike Freemon <mfreemon@cloudflare.com>
+Subject: [PATCH] tcp: bound receive queue collapse by socket memory use
+
+Port of Cloudflare's tcp_collapse_max_bytes patch to Linux 7.3.6.
+This build enables the policy by default at 6 MiB. The threshold is
+per network namespace and can be disabled by setting it to zero.
+Original: https://github.com/cloudflare/linux/blob/master/patches/0014-add-a-sysctl-to-enable-disable-tcp_collapse-logic.patch
+
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -214,6 +214,7 @@
+ 	u8 sysctl_tcp_rfc1337;
+ 	u8 sysctl_tcp_abort_on_overflow;
+ 	u8 sysctl_tcp_fack; /* obsolete */
++	unsigned int sysctl_tcp_collapse_max_bytes;
+ 	int sysctl_tcp_max_reordering;
+ 	int sysctl_tcp_adv_win_scale; /* obsolete */
+ 	u8 sysctl_tcp_dsack;
+diff --git a/include/trace/events/tcp.h b/include/trace/events/tcp.h
+--- a/include/trace/events/tcp.h
++++ b/include/trace/events/tcp.h
+@@ -191,6 +191,13 @@
+ );
+ 
+ DEFINE_EVENT(tcp_event_sk, tcp_destroy_sock,
++
++	TP_PROTO(struct sock *sk),
++
++	TP_ARGS(sk)
++);
++
++DEFINE_EVENT(tcp_event_sk, tcp_collapse_max_bytes_exceeded,
+ 
+ 	TP_PROTO(struct sock *sk),
+ 
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -1350,6 +1350,13 @@
+ 		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{
++		.procname	= "tcp_collapse_max_bytes",
++		.data		= &init_net.ipv4.sysctl_tcp_collapse_max_bytes,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
++	{
+ 		.procname	= "tcp_moderate_rcvbuf",
+ 		.data		= &init_net.ipv4.sysctl_tcp_moderate_rcvbuf,
+ 		.maxlen		= sizeof(u8),
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -3486,6 +3486,7 @@
+ 	net->ipv4.sysctl_tcp_adv_win_scale = 1;
+ 	net->ipv4.sysctl_tcp_frto = 2;
+ 	net->ipv4.sysctl_tcp_moderate_rcvbuf = 1;
++	net->ipv4.sysctl_tcp_collapse_max_bytes = 6 * 1024 * 1024;
+ 	net->ipv4.sysctl_tcp_rcvbuf_low_rtt = USEC_PER_MSEC;
+ 	/* This limits the percentage of the congestion window which we
+ 	 * will allow a single TSO frame to consume.  Building TSO frames
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -5999,6 +5999,7 @@
+ static int tcp_prune_queue(struct sock *sk, const struct sk_buff *in_skb)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int collapse_limit;
+ 
+ 	/* Do nothing if our queues are empty. */
+ 	if (!atomic_read(&sk->sk_rmem_alloc))
+@@ -6013,6 +6014,13 @@
+ 
+ 	if (tcp_can_ingest(sk, in_skb))
+ 		return 0;
++
++	/* Bound the cost of reclaim on large, stalled receive queues. */
++	collapse_limit = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_collapse_max_bytes);
++	if (collapse_limit && atomic_read(&sk->sk_rmem_alloc) > collapse_limit) {
++		trace_tcp_collapse_max_bytes_exceeded(sk);
++		goto drop;
++	}
+ 
+ 	tcp_collapse_ofo_queue(sk);
+ 	if (!skb_queue_empty(&sk->sk_receive_queue))
+@@ -6032,6 +6040,7 @@
+ 	if (tcp_can_ingest(sk, in_skb))
+ 		return 0;
+ 
++drop:
+ 	/* If we are really being abused, tell the caller to silently
+ 	 * drop receive data on the floor.  It will get retransmitted
+ 	 * and hopefully then we'll have sufficient space.
+diff --git a/Documentation/networking/ip-sysctl.rst b/Documentation/networking/ip-sysctl.rst
+--- a/Documentation/networking/ip-sysctl.rst
++++ b/Documentation/networking/ip-sysctl.rst
+@@ -680,6 +680,16 @@
+ 	Possible values: 0 - 86400 (1 day)
+ 
+ 	Default: 300
++
++tcp_collapse_max_bytes - UNSIGNED INTEGER
++	When a full TCP receive queue still exceeds its socket limit after
++	window clamping, skip collapse if the socket's allocated receive
++	memory exceeds this many bytes. This avoids lengthy copying at the
++	cost of potentially dropping the arriving segment. Zero restores
++	unrestricted collapse. This setting is per network namespace.
++	Receive buffer size auto-tuning is controlled by tcp_moderate_rcvbuf.
++
++	Default: 6291456 (6 MiB)
+ 
+ tcp_moderate_rcvbuf - BOOLEAN
+ 	If enabled, TCP performs receive buffer auto-tuning, attempting to
+diff --git a/Documentation/networking/net_cachelines/netns_ipv4_sysctl.rst b/Documentation/networking/net_cachelines/netns_ipv4_sysctl.rst
+--- a/Documentation/networking/net_cachelines/netns_ipv4_sysctl.rst
++++ b/Documentation/networking/net_cachelines/netns_ipv4_sysctl.rst
+@@ -97,6 +97,7 @@
+ u8                              sysctl_tcp_rfc1337
+ u8                              sysctl_tcp_abort_on_overflow
+ u8                              sysctl_tcp_fack
++unsigned int                    sysctl_tcp_collapse_max_bytes                                                        tcp_prune_queue()
+ int                             sysctl_tcp_max_reordering                                                            tcp_check_sack_reordering
+ int                             sysctl_tcp_adv_win_scale                                                             tcp_init_buffer_space
+ u8                              sysctl_tcp_dsack                                                                     partial_packet_or_retrans_in_tcp_data_queue
